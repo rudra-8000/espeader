@@ -707,9 +707,25 @@ void openBook(const String& filename) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  ZIP HELPER — decompress one file from zip into a ps_malloc'd buffer.
-//  Uses mz_zip_reader_extract_to_mem() so miniz never internally MZ_MALLOCs
-//  the output — we hand it our PSRAM pointer directly.
+//  ZIP FILE READ CALLBACK
+//  miniz uses this to read the archive directly from FFat — no RAM buffer needed.
+// ─────────────────────────────────────────────────────────────────────────────
+struct ZipFileCtx {
+  File   file;
+  size_t size;
+};
+
+static size_t zipFileReadCb(void* pOpaque, mz_uint64 file_ofs, void* pBuf, size_t n) {
+  ZipFileCtx* ctx = (ZipFileCtx*)pOpaque;
+  if (!ctx->file || file_ofs >= ctx->size) return 0;
+  if (file_ofs + n > ctx->size) n = ctx->size - (size_t)file_ofs;
+  ctx->file.seek((size_t)file_ofs);
+  return ctx->file.read((uint8_t*)pBuf, n);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  ZIP HELPER — decompress one entry into PSRAM (or heap for tiny files).
+//  Caller must free() the result.
 // ─────────────────────────────────────────────────────────────────────────────
 static uint8_t* zipExtractToPsram(mz_zip_archive* zip, const char* filename, size_t* outSize) {
   int idx = mz_zip_reader_locate_file(zip, filename, nullptr, 0);
@@ -718,9 +734,13 @@ static uint8_t* zipExtractToPsram(mz_zip_archive* zip, const char* filename, siz
   if (!mz_zip_reader_file_stat(zip, idx, &st)) return nullptr;
   size_t sz = (size_t)st.m_uncomp_size;
   *outSize = sz;
-  uint8_t* b = (sz > 2048) ? (uint8_t*)ps_malloc(sz+1) : (uint8_t*)malloc(sz+1);
+  uint8_t* b = (sz > 2048)
+               ? (uint8_t*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+               : (uint8_t*)malloc(sz + 1);
+  if (!b) { b = (uint8_t*)malloc(sz + 1); }   // fallback to heap
   if (!b) { Serial.printf("zip: alloc %u failed\n", (unsigned)sz); return nullptr; }
   if (!mz_zip_reader_extract_to_mem(zip, idx, b, sz, 0)) {
+    Serial.printf("zip: decompress failed '%s'\n", filename);
     free(b); return nullptr;
   }
   b[sz] = 0;
@@ -728,139 +748,301 @@ static uint8_t* zipExtractToPsram(mz_zip_archive* zip, const char* filename, siz
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  EPUB EXTRACTION — callback edition
-//  chapterCb(index, total, htmlString) called per spine doc. One chapter
-//  in memory at a time — safe for large books.
+//  EPUB EXTRACTION — file-callback edition
+//  miniz reads ZIP headers directly from FFat — zero heap/PSRAM for the archive.
+//  Only one decompressed chapter lives in PSRAM at a time.
+//  chapterCb(index, total, htmlString) called per spine document.
 // ─────────────────────────────────────────────────────────────────────────────
 bool extractEpub(const String& epubPath, String& coverPath,
                  std::function<void(int,int,const String&)> chapterCb) {
 
-  File epubFile = FFat.open(epubPath, "r");
-  if (!epubFile) { Serial.println("Cannot open epub"); return false; }
-  size_t fileSize = epubFile.size();
-  Serial.printf("EPUB size: %u bytes\n", fileSize);
+  ZipFileCtx ctx;
+  ctx.file = FFat.open(epubPath, "r");
+  if (!ctx.file) { Serial.println("Cannot open epub"); return false; }
+  ctx.size = ctx.file.size();
+  Serial.printf("EPUB size: %u bytes  heap:%u  psram:%u\n",
+                ctx.size, ESP.getFreeHeap(), ESP.getFreePsram());
 
-  // Load compressed ZIP into PSRAM — this is just raw compressed bytes, fine in PSRAM
-  uint8_t* buf = (uint8_t*)ps_malloc(fileSize);
-  if (!buf) buf = (uint8_t*)malloc(fileSize);
-  if (!buf) { Serial.println("alloc failed"); epubFile.close(); return false; }
-  epubFile.read(buf, fileSize);
-  epubFile.close();
-  Serial.printf("Loaded into %s\n", esp_ptr_external_ram(buf) ? "PSRAM" : "heap");
-
+  // Init miniz with read callback — m_pState allocation is only ~few KB from heap
   mz_zip_archive zip;
   memset(&zip, 0, sizeof(zip));
-  if (!mz_zip_reader_init_mem(&zip, buf, fileSize, 0)) {
-    Serial.println("miniz: zip open failed"); free(buf); return false;
+  zip.m_pRead      = zipFileReadCb;
+  zip.m_pIO_opaque = &ctx;
+  if (!mz_zip_reader_init(&zip, ctx.size, 0)) {
+    Serial.printf("miniz: init failed (err %d)\n", (int)mz_zip_get_last_error(&zip));
+    ctx.file.close(); return false;
   }
-  Serial.printf("ZIP entries: %d\n", (int)mz_zip_reader_get_num_files(&zip));
+  int numFiles = (int)mz_zip_reader_get_num_files(&zip);
+  Serial.printf("ZIP entries: %d  heap after init:%u\n", numFiles, ESP.getFreeHeap());
 
-  // ── 1. Find OPF path ──
+  // ── 1. OPF path from META-INF/container.xml ──
   String opfPath = "";
   {
     size_t sz = 0;
     uint8_t* d = zipExtractToPsram(&zip, "META-INF/container.xml", &sz);
     if (d) {
       const char* p = strstr((char*)d, "full-path=\"");
-      if (p) { p+=11; const char* e=strchr(p,'"'); if(e) opfPath=String(p,e-p); }
+      if (p) { p += 11; const char* e = strchr(p, '"'); if (e) opfPath = String(p, e-p); }
       free(d);
     }
   }
   if (opfPath.length() == 0) {
-    int n = (int)mz_zip_reader_get_num_files(&zip);
-    for (int i=0;i<n;i++) {
-      mz_zip_archive_file_stat st; mz_zip_reader_file_stat(&zip,i,&st);
-      if (String(st.m_filename).endsWith(".opf")) { opfPath=st.m_filename; break; }
+    for (int i = 0; i < numFiles; i++) {
+      mz_zip_archive_file_stat st; mz_zip_reader_file_stat(&zip, i, &st);
+      if (String(st.m_filename).endsWith(".opf")) { opfPath = st.m_filename; break; }
     }
   }
-  if (opfPath.length()==0) {
-    Serial.println("No OPF"); mz_zip_reader_end(&zip); free(buf); return false;
+  if (opfPath.length() == 0) {
+    Serial.println("No OPF found");
+    mz_zip_reader_end(&zip); ctx.file.close(); return false;
   }
   Serial.println("OPF: " + opfPath);
   String opfDir = "";
   int ls = opfPath.lastIndexOf('/');
-  if (ls != -1) opfDir = opfPath.substring(0, ls+1);
+  if (ls != -1) opfDir = opfPath.substring(0, ls + 1);
 
   // ── 2. Parse manifest + spine from OPF ──
-  std::map<String,String> manifest;
-  std::vector<String> spineIds;   // just short ID strings, not content
+  std::map<String, String> manifest;
+  std::vector<String> spineIds;   // just short idref strings — negligible memory
   {
     size_t sz = 0;
     uint8_t* d = zipExtractToPsram(&zip, opfPath.c_str(), &sz);
-    if (!d) { mz_zip_reader_end(&zip); free(buf); return false; }
+    if (!d) {
+      Serial.println("Cannot extract OPF");
+      mz_zip_reader_end(&zip); ctx.file.close(); return false;
+    }
     char* opf = (char*)d;
 
     char* p = opf;
     while ((p = strstr(p, "<item ")) != nullptr) {
       char* e = strchr(p, '>'); if (!e) break;
-      char sv=*e; *e=0;
-      auto ga = [&](const char* a) -> String {
-        char k[40]; snprintf(k,sizeof(k)," %s=\"",a);
-        char* x=strstr(p,k); if(!x) return "";
-        x+=strlen(k); char* y=strchr(x,'"'); if(!y) return "";
-        return String(x,y-x);
+      char sv = *e; *e = 0;
+      auto ga = [&](const char* attr) -> String {
+        char key[40]; snprintf(key, sizeof(key), " %s=\"", attr);
+        char* x = strstr(p, key); if (!x) return "";
+        x += strlen(key);
+        char* y = strchr(x, '"'); if (!y) return "";
+        return String(x, y - x);
       };
-      String id=ga("id"),href=ga("href"),mt=ga("media-type"),pr=ga("properties");
-      *e=sv;
-      href.replace("%20"," ");
-      if (id.length()&&href.length()) manifest[id]=href;
-      if (coverPath.length()==0 &&
-          (pr.indexOf("cover-image")!=-1||id.indexOf("cover")!=-1) &&
-          mt.indexOf("image")!=-1) {
-        coverPath = opfDir+href;
+      String id = ga("id"), href = ga("href"),
+             mt = ga("media-type"), pr = ga("properties");
+      *e = sv;
+      href.replace("%20", " ");
+      if (id.length() && href.length()) manifest[id] = href;
+      if (coverPath.length() == 0 &&
+          (pr.indexOf("cover-image") != -1 || id.indexOf("cover") != -1) &&
+          mt.indexOf("image") != -1) {
+        coverPath = opfDir + href;
       }
-      p=e+1;
+      p = e + 1;
     }
-
     p = opf;
     while ((p = strstr(p, "<itemref ")) != nullptr) {
-      char* e=strchr(p,'>'); if(!e) break;
-      char sv=*e; *e=0;
-      char* a=strstr(p,"idref=\"");
-      if(a){a+=7; char*b=strchr(a,'"'); if(b) spineIds.push_back(String(a,b-a));}
-      *e=sv; p=e+1;
+      char* e = strchr(p, '>'); if (!e) break;
+      char sv = *e; *e = 0;
+      char* a = strstr(p, "idref=\"");
+      if (a) { a += 7; char* b = strchr(a, '"'); if (b) spineIds.push_back(String(a, b-a)); }
+      *e = sv; p = e + 1;
     }
     free(d);
   }
-  Serial.printf("Manifest:%d  Spine:%d\n",(int)manifest.size(),(int)spineIds.size());
+  Serial.printf("Manifest:%d  Spine:%d  heap:%u\n",
+                (int)manifest.size(), (int)spineIds.size(), ESP.getFreeHeap());
 
   // ── 3. Save cover image ──
   if (coverPath.length() > 0) {
-    size_t sz=0;
+    size_t sz = 0;
     uint8_t* img = zipExtractToPsram(&zip, coverPath.c_str(), &sz);
     if (img) {
       String ext = coverPath.substring(coverPath.lastIndexOf('.'));
-      File cf = FFat.open("/cover_raw"+ext, "w");
-      if (cf) { cf.write(img,sz); cf.close(); coverPath="/cover_raw"+ext; }
+      File cf = FFat.open("/cover_raw" + ext, "w");
+      if (cf) { cf.write(img, sz); cf.close(); coverPath = "/cover_raw" + ext; }
       free(img);
     }
   }
 
-  // ── 4. Extract + callback each spine chapter ──
+  // ── 4. Extract chapters one at a time ──
   int total = (int)spineIds.size();
   int count = 0;
-  for (int i=0; i<total && count<300; i++) {
-    if (manifest.count(spineIds[i])==0) continue;
+  for (int i = 0; i < total && count < 300; i++) {
+    if (manifest.count(spineIds[i]) == 0) continue;
     String href = opfDir + manifest[spineIds[i]];
-    int frag=href.indexOf('#'); if(frag!=-1) href=href.substring(0,frag);
+    int frag = href.indexOf('#'); if (frag != -1) href = href.substring(0, frag);
 
-    size_t sz=0;
+    size_t sz = 0;
     uint8_t* d = zipExtractToPsram(&zip, href.c_str(), &sz);
     if (d) {
       String chapter((char*)d, sz);
-      free(d);                      // free PSRAM immediately — don't accumulate
+      free(d);   // free immediately — never accumulate
       chapterCb(count, total, chapter);
       count++;
+    } else {
+      Serial.printf("  skip '%s'\n", href.c_str());
     }
     yield();
   }
 
   mz_zip_reader_end(&zip);
-  free(buf);
-  Serial.printf("Extracted %d chapters  heap:%u  psram:%u\n",
-                count, ESP.getFreeHeap(), ESP.getFreePsram());
+  ctx.file.close();
+  Serial.printf("Done: %d/%d chapters  heap:%u  psram:%u\n",
+                count, total, ESP.getFreeHeap(), ESP.getFreePsram());
   return count > 0;
 }
+// // ─────────────────────────────────────────────────────────────────────────────
+// //  ZIP HELPER — decompress one file from zip into a ps_malloc'd buffer.
+// //  Uses mz_zip_reader_extract_to_mem() so miniz never internally MZ_MALLOCs
+// //  the output — we hand it our PSRAM pointer directly.
+// // ─────────────────────────────────────────────────────────────────────────────
+// static uint8_t* zipExtractToPsram(mz_zip_archive* zip, const char* filename, size_t* outSize) {
+//   int idx = mz_zip_reader_locate_file(zip, filename, nullptr, 0);
+//   if (idx < 0) { Serial.printf("zip: '%s' not found\n", filename); return nullptr; }
+//   mz_zip_archive_file_stat st;
+//   if (!mz_zip_reader_file_stat(zip, idx, &st)) return nullptr;
+//   size_t sz = (size_t)st.m_uncomp_size;
+//   *outSize = sz;
+//   uint8_t* b = (sz > 2048) ? (uint8_t*)ps_malloc(sz+1) : (uint8_t*)malloc(sz+1);
+//   if (!b) { Serial.printf("zip: alloc %u failed\n", (unsigned)sz); return nullptr; }
+//   if (!mz_zip_reader_extract_to_mem(zip, idx, b, sz, 0)) {
+//     free(b); return nullptr;
+//   }
+//   b[sz] = 0;
+//   return b;
+// }
+
+// // ─────────────────────────────────────────────────────────────────────────────
+// //  EPUB EXTRACTION — callback edition
+// //  chapterCb(index, total, htmlString) called per spine doc. One chapter
+// //  in memory at a time — safe for large books.
+// // ─────────────────────────────────────────────────────────────────────────────
+// bool extractEpub(const String& epubPath, String& coverPath,
+//                  std::function<void(int,int,const String&)> chapterCb) {
+
+//   File epubFile = FFat.open(epubPath, "r");
+//   if (!epubFile) { Serial.println("Cannot open epub"); return false; }
+//   size_t fileSize = epubFile.size();
+//   Serial.printf("EPUB size: %u bytes\n", fileSize);
+
+//   // Load compressed ZIP into PSRAM — this is just raw compressed bytes, fine in PSRAM
+//   uint8_t* buf = (uint8_t*)ps_malloc(fileSize);
+//   if (!buf) buf = (uint8_t*)malloc(fileSize);
+//   if (!buf) { Serial.println("alloc failed"); epubFile.close(); return false; }
+//   epubFile.read(buf, fileSize);
+//   epubFile.close();
+//   Serial.printf("Loaded into %s\n", esp_ptr_external_ram(buf) ? "PSRAM" : "heap");
+
+//   mz_zip_archive zip;
+//   memset(&zip, 0, sizeof(zip));
+//   if (!mz_zip_reader_init_mem(&zip, buf, fileSize, 0)) {
+//     Serial.println("miniz: zip open failed"); free(buf); return false;
+//   }
+//   Serial.printf("ZIP entries: %d\n", (int)mz_zip_reader_get_num_files(&zip));
+
+//   // ── 1. Find OPF path ──
+//   String opfPath = "";
+//   {
+//     size_t sz = 0;
+//     uint8_t* d = zipExtractToPsram(&zip, "META-INF/container.xml", &sz);
+//     if (d) {
+//       const char* p = strstr((char*)d, "full-path=\"");
+//       if (p) { p+=11; const char* e=strchr(p,'"'); if(e) opfPath=String(p,e-p); }
+//       free(d);
+//     }
+//   }
+//   if (opfPath.length() == 0) {
+//     int n = (int)mz_zip_reader_get_num_files(&zip);
+//     for (int i=0;i<n;i++) {
+//       mz_zip_archive_file_stat st; mz_zip_reader_file_stat(&zip,i,&st);
+//       if (String(st.m_filename).endsWith(".opf")) { opfPath=st.m_filename; break; }
+//     }
+//   }
+//   if (opfPath.length()==0) {
+//     Serial.println("No OPF"); mz_zip_reader_end(&zip); free(buf); return false;
+//   }
+//   Serial.println("OPF: " + opfPath);
+//   String opfDir = "";
+//   int ls = opfPath.lastIndexOf('/');
+//   if (ls != -1) opfDir = opfPath.substring(0, ls+1);
+
+//   // ── 2. Parse manifest + spine from OPF ──
+//   std::map<String,String> manifest;
+//   std::vector<String> spineIds;   // just short ID strings, not content
+//   {
+//     size_t sz = 0;
+//     uint8_t* d = zipExtractToPsram(&zip, opfPath.c_str(), &sz);
+//     if (!d) { mz_zip_reader_end(&zip); free(buf); return false; }
+//     char* opf = (char*)d;
+
+//     char* p = opf;
+//     while ((p = strstr(p, "<item ")) != nullptr) {
+//       char* e = strchr(p, '>'); if (!e) break;
+//       char sv=*e; *e=0;
+//       auto ga = [&](const char* a) -> String {
+//         char k[40]; snprintf(k,sizeof(k)," %s=\"",a);
+//         char* x=strstr(p,k); if(!x) return "";
+//         x+=strlen(k); char* y=strchr(x,'"'); if(!y) return "";
+//         return String(x,y-x);
+//       };
+//       String id=ga("id"),href=ga("href"),mt=ga("media-type"),pr=ga("properties");
+//       *e=sv;
+//       href.replace("%20"," ");
+//       if (id.length()&&href.length()) manifest[id]=href;
+//       if (coverPath.length()==0 &&
+//           (pr.indexOf("cover-image")!=-1||id.indexOf("cover")!=-1) &&
+//           mt.indexOf("image")!=-1) {
+//         coverPath = opfDir+href;
+//       }
+//       p=e+1;
+//     }
+
+//     p = opf;
+//     while ((p = strstr(p, "<itemref ")) != nullptr) {
+//       char* e=strchr(p,'>'); if(!e) break;
+//       char sv=*e; *e=0;
+//       char* a=strstr(p,"idref=\"");
+//       if(a){a+=7; char*b=strchr(a,'"'); if(b) spineIds.push_back(String(a,b-a));}
+//       *e=sv; p=e+1;
+//     }
+//     free(d);
+//   }
+//   Serial.printf("Manifest:%d  Spine:%d\n",(int)manifest.size(),(int)spineIds.size());
+
+//   // ── 3. Save cover image ──
+//   if (coverPath.length() > 0) {
+//     size_t sz=0;
+//     uint8_t* img = zipExtractToPsram(&zip, coverPath.c_str(), &sz);
+//     if (img) {
+//       String ext = coverPath.substring(coverPath.lastIndexOf('.'));
+//       File cf = FFat.open("/cover_raw"+ext, "w");
+//       if (cf) { cf.write(img,sz); cf.close(); coverPath="/cover_raw"+ext; }
+//       free(img);
+//     }
+//   }
+
+//   // ── 4. Extract + callback each spine chapter ──
+//   int total = (int)spineIds.size();
+//   int count = 0;
+//   for (int i=0; i<total && count<300; i++) {
+//     if (manifest.count(spineIds[i])==0) continue;
+//     String href = opfDir + manifest[spineIds[i]];
+//     int frag=href.indexOf('#'); if(frag!=-1) href=href.substring(0,frag);
+
+//     size_t sz=0;
+//     uint8_t* d = zipExtractToPsram(&zip, href.c_str(), &sz);
+//     if (d) {
+//       String chapter((char*)d, sz);
+//       free(d);                      // free PSRAM immediately — don't accumulate
+//       chapterCb(count, total, chapter);
+//       count++;
+//     }
+//     yield();
+//   }
+
+//   mz_zip_reader_end(&zip);
+//   free(buf);
+//   Serial.printf("Extracted %d chapters  heap:%u  psram:%u\n",
+//                 count, ESP.getFreeHeap(), ESP.getFreePsram());
+//   return count > 0;
+// }
 // ─────────────────────────────────────────────────────────────────────────────
 //  HTML → PLAIN TEXT
 //  Strips tags, decodes common entities, collapses whitespace.
