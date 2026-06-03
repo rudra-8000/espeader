@@ -710,43 +710,88 @@ void openBook(const String& filename) {
 //  ZIP FILE READ CALLBACK
 //  miniz uses this to read the archive directly from FFat — no RAM buffer needed.
 // ─────────────────────────────────────────────────────────────────────────────
-struct ZipFileCtx {
-  File   file;
-  size_t size;
-};
+// struct ZipFileCtx {
+//   File   file;
+//   size_t size;
+// };
 
-static size_t zipFileReadCb(void* pOpaque, mz_uint64 file_ofs, void* pBuf, size_t n) {
-  ZipFileCtx* ctx = (ZipFileCtx*)pOpaque;
-  if (!ctx->file || file_ofs >= ctx->size) return 0;
-  if (file_ofs + n > ctx->size) n = ctx->size - (size_t)file_ofs;
-  ctx->file.seek((size_t)file_ofs);
-  return ctx->file.read((uint8_t*)pBuf, n);
-}
+// static size_t zipFileReadCb(void* pOpaque, mz_uint64 file_ofs, void* pBuf, size_t n) {
+//   ZipFileCtx* ctx = (ZipFileCtx*)pOpaque;
+//   if (!ctx->file || file_ofs >= ctx->size) return 0;
+//   if (file_ofs + n > ctx->size) n = ctx->size - (size_t)file_ofs;
+//   ctx->file.seek((size_t)file_ofs);
+//   return ctx->file.read((uint8_t*)pBuf, n);
+// }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  ZIP HELPER — decompress one entry into PSRAM (or heap for tiny files).
-//  Caller must free() the result.
-// ─────────────────────────────────────────────────────────────────────────────
-static uint8_t* zipExtractToPsram(mz_zip_archive* zip, const char* filename, size_t* outSize) {
+// // ─────────────────────────────────────────────────────────────────────────────
+// //  ZIP HELPER — decompress one entry into PSRAM (or heap for tiny files).
+// //  Caller must free() the result.
+// // ─────────────────────────────────────────────────────────────────────────────
+// static uint8_t* zipExtractToPsram(mz_zip_archive* zip, const char* filename, size_t* outSize) {
+//   int idx = mz_zip_reader_locate_file(zip, filename, nullptr, 0);
+//   if (idx < 0) { Serial.printf("zip: '%s' not found\n", filename); return nullptr; }
+//   mz_zip_archive_file_stat st;
+//   if (!mz_zip_reader_file_stat(zip, idx, &st)) return nullptr;
+//   size_t sz = (size_t)st.m_uncomp_size;
+//   *outSize = sz;
+//   uint8_t* b = (sz > 2048)
+//                ? (uint8_t*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+//                : (uint8_t*)malloc(sz + 1);
+//   if (!b) { b = (uint8_t*)malloc(sz + 1); }   // fallback to heap
+//   if (!b) { Serial.printf("zip: alloc %u failed\n", (unsigned)sz); return nullptr; }
+//   if (!mz_zip_reader_extract_to_mem(zip, idx, b, sz, 0)) {
+//     Serial.printf("zip: decompress failed '%s'\n", filename);
+//     free(b); return nullptr;
+//   }
+//   b[sz] = 0;
+//   return b;
+// }
+
+static uint8_t* zipExtractFile(mz_zip_archive* zip,
+                               const char* filename,
+                               size_t* outSize) {
   int idx = mz_zip_reader_locate_file(zip, filename, nullptr, 0);
   if (idx < 0) { Serial.printf("zip: '%s' not found\n", filename); return nullptr; }
   mz_zip_archive_file_stat st;
   if (!mz_zip_reader_file_stat(zip, idx, &st)) return nullptr;
   size_t sz = (size_t)st.m_uncomp_size;
-  *outSize = sz;
+  *outSize  = sz;
   uint8_t* b = (sz > 2048)
-               ? (uint8_t*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
-               : (uint8_t*)malloc(sz + 1);
-  if (!b) { b = (uint8_t*)malloc(sz + 1); }   // fallback to heap
-  if (!b) { Serial.printf("zip: alloc %u failed\n", (unsigned)sz); return nullptr; }
+    ? (uint8_t*)heap_caps_malloc(sz + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)
+    : (uint8_t*)malloc(sz + 1);
+  if (!b) b = (uint8_t*)malloc(sz + 1);
+  if (!b) { Serial.printf("alloc %u failed\n", (unsigned)sz); return nullptr; }
   if (!mz_zip_reader_extract_to_mem(zip, idx, b, sz, 0)) {
-    Serial.printf("zip: decompress failed '%s'\n", filename);
     free(b); return nullptr;
   }
   b[sz] = 0;
   return b;
 }
 
+bool extractEpub(const String& epubPath, String& coverPath,
+                 std::function<void(int,int,const String&)> chapterCb) {
+
+  File epubFile = FFat.open(epubPath, "r");
+  if (!epubFile) { Serial.println("Cannot open epub"); return false; }
+  size_t fileSize = epubFile.size();
+  Serial.printf("EPUB size: %u bytes\n", fileSize);
+
+  // Load compressed archive into PSRAM — stays there for the whole parse
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(fileSize,
+                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!buf) buf = (uint8_t*)malloc(fileSize);
+  if (!buf) { Serial.println("alloc failed"); epubFile.close(); return false; }
+  epubFile.read(buf, fileSize);
+  epubFile.close();
+
+  mz_zip_archive zip;
+  memset(&zip, 0, sizeof(zip));
+  // *** KEY FIX: use init_mem, not init with custom callbacks ***
+  if (!mz_zip_reader_init_mem(&zip, buf, fileSize, 0)) {
+    Serial.printf("miniz: zip open failed\n");
+    free(buf); return false;
+  }
+  Serial.printf("ZIP entries: %d\n", (int)mz_zip_reader_get_num_files(&zip));
 // ─────────────────────────────────────────────────────────────────────────────
 //  EPUB EXTRACTION — file-callback edition
 //  miniz reads ZIP headers directly from FFat — zero heap/PSRAM for the archive.
